@@ -1,12 +1,13 @@
 /* 
  * tsh - A tiny shell program with job control
  * 
- * <Put your name and login ID here>
+ * <Dhruv Srikanth dhruvsrikanth>
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdbool.h>
 #include <ctype.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -18,6 +19,7 @@
 #define MAXARGS     128   /* max args on a command line */
 #define MAXJOBS      16   /* max jobs at any point in time */
 #define MAXJID    1<<16   /* max job ID */
+#define MAXHISTORY  10   /* max history size */
 
 /* Job states */
 #define UNDEF 0 /* undefined */
@@ -41,7 +43,8 @@ char prompt[] = "tsh> ";    /* command line prompt (DO NOT CHANGE) */
 int verbose = 0;            /* if true, print additional output */
 int nextjid = 1;            /* next job ID to allocate */
 char sbuf[MAXLINE];         /* for composing sprintf messages */
-char * username;            /* The name of the user currently logged into the shell */
+char *username;             /* The name of the user currently logged into the shell */
+char *home;                 /* The home directory of the user currently logged into the shell */
 struct job_t {              /* The job struct */
     pid_t pid;              /* job PID */
     int jid;                /* job ID [1, 2, ...] */
@@ -49,6 +52,7 @@ struct job_t {              /* The job struct */
     char cmdline[MAXLINE];  /* command line */
 };
 struct job_t jobs[MAXJOBS]; /* The job list */
+char history[MAXHISTORY][MAXLINE];  /* The history list */
 /* End global variables */
 
 
@@ -78,18 +82,35 @@ struct job_t *getjobpid(struct job_t *jobs, pid_t pid);
 struct job_t *getjobjid(struct job_t *jobs, int jid); 
 int pid2jid(pid_t pid); 
 void listjobs(struct job_t *jobs);
-char * login();
+char *login();
 void usage(void);
 void unix_error(char *msg);
 void app_error(char *msg);
+void reset_state_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
+
+/* Additional helper functions */
+void authenticate(const char *username, const char *password, bool *authenticated);
+void exec_builtin(char **argv);
+bool are_open_jobs(struct job_t *jobs);
+void quit();
+void logout();
+void init_history();
+void show_history();
+int history_length();
+void add_to_history(char *cmdline);
+void write_to_history(char *cmdline);
+void run_nth_history(char *cmdline);
+void strrevr(char *str, const int length);
+
+
+
 
 /*
  * main - The shell's main routine 
  */
-int main(int argc, char **argv) 
-{
+int main(int argc, char **argv) {
     char c;
     char cmdline[MAXLINE];
     int emit_prompt = 1; /* emit prompt (default) */
@@ -101,18 +122,18 @@ int main(int argc, char **argv)
     /* Parse the command line */
     while ((c = getopt(argc, argv, "hvp")) != EOF) {
         switch (c) {
-        case 'h':             /* print help message */
-            usage();
-	    break;
-        case 'v':             /* emit additional diagnostic info */
-            verbose = 1;
-	    break;
-        case 'p':             /* don't print a prompt */
-            emit_prompt = 0;  /* handy for automatic testing */
-	    break;
-	default:
-            usage();
-	}
+            case 'h':             /* print help message */
+                usage();
+                break;
+            case 'v':             /* emit additional diagnostic info */
+                verbose = 1;
+                break;
+            case 'p':             /* don't print a prompt */
+                emit_prompt = 0;  /* handy for automatic testing */
+                break;
+            default:
+                usage();
+        }
     }
 
     /* Install the signal handlers */
@@ -130,30 +151,43 @@ int main(int argc, char **argv)
 
     /* Have a user log into the shell */
     username = login();
-    
+
+    /* Initialize the history of commands used previously by the user */
+    init_history();
+
     
     /* Execute the shell's read/eval loop */
+    bool just_logged_in = true;
     while (1) {
+        /* Read command line */
+        if (emit_prompt) {
+            if (just_logged_in) {
+                just_logged_in = false;
+            } else {
+                printf("%s", prompt);
+            }
+            fflush(stdout);
+        }
 
-	/* Read command line */
-	if (emit_prompt) {
-	    printf("%s", prompt);
-	    fflush(stdout);
-	}
-	if ((fgets(cmdline, MAXLINE, stdin) == NULL) && ferror(stdin))
-	    app_error("fgets error");
-	if (feof(stdin)) { /* End of file (ctrl-d) */
-	    fflush(stdout);
-	    exit(0);
-	}
+        if ((fgets(cmdline, MAXLINE, stdin) == NULL) && (ferror(stdin))) {
+            app_error("fgets error");
+        }
+        
+        if (feof(stdin)) { /* End of file (ctrl-d) */
+            fflush(stdout);
+            exit(0);
+        }
 
-	/* Evaluate the command line */
-	eval(cmdline);
-	fflush(stdout);
-	fflush(stdout);
+        /* Evaluate the command line */
+        eval(cmdline);
+        fflush(stdout);
+        fflush(stdout);
     } 
 
+    free(username);
+    free(home);
     exit(0); /* control never reaches here */
+
 }
 
 /*
@@ -163,10 +197,282 @@ int main(int argc, char **argv)
  *
  * This function returns a string of the username that is logged in
  */
-char * login() {
-    
+char *login() {
+
+    bool authenticated = false;
+    while (1) {
+        /* Get the user's details */ 
+        printf("username: ");
+        char *username = malloc(sizeof(char) * MAXLINE);
+        scanf("%s", username);
+
+        if (strcmp(username, "quit") == 0) {
+            quit();
+        }
+        
+        printf("password: ");
+        char *password = malloc(sizeof(char) * MAXLINE);
+        scanf("%s", password);
+
+        /* Authenticate the validity of the user's entered details */
+        authenticate(username, password, &authenticated);
+
+        /* Free memory not used after this */
+        free(password);
+
+        /* Try again if information is incorrect otherwise return password */
+        if (!authenticated) {
+            reset_state_error("User Authentication failed. Please try again.");
+        } else {
+            return username;
+        }
+    }
+
     return NULL;
 }
+
+/* Authentication function for verifying username and password in /etc/passwd */ 
+void authenticate(const char *username, const char *password, bool *authenticated) {
+    /* Open the file */
+    FILE *fp;
+    fp = fopen("etc/passwd", "r");
+    if (fp == NULL) {
+        reset_state_error("Error opening file.\n");
+        fclose(fp);
+        return;
+    }
+
+    /* Read the file one line at a time comparing username and password */
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read;
+
+    while ((read = getline(&line, &len, fp)) != -1) {
+        char *token = strtok(line, ":");
+        if (strcmp(token, username) == 0) {
+            token = strtok(NULL, ":");
+            if (strcmp(token, password) == 0) {
+                *authenticated = true;
+
+                token = strtok(NULL, ":");
+                /* Get the home directory of the shell for the user logged in */
+                home = malloc(sizeof(char) * (strlen(token) + 1));
+                /* Remove newline character at the end */
+                token[strlen(token) - 1] = '\0';
+                strcpy(home, token);
+                break;
+            }
+        }
+    }
+
+    /* Free memory not used after this */
+    free(line);
+    fclose(fp);
+}
+
+/* quit - Quit the shell */
+void quit() {
+    /* Free memory not used after this */
+    free(home);
+    free(username);
+    exit(0);
+}
+
+/* logout - Logout of the shell */
+void logout() {
+    /* Free memory not used after this */
+    free(home);
+    free(username);
+
+    /* Check if any jobs are remaining */
+    if (are_open_jobs(jobs)) {
+        reset_state_error("There are suspended jobs.\n");
+    } else {
+        exit(0);
+    }
+}
+
+/* init_history - Initialize the history array with the user's previous commands */
+void init_history() {
+    /* Get the file details */
+    const size_t history_file_size = strlen(home) + 1 + 12; /* Does not include the null terminator */
+    char *history_file = malloc(sizeof(char) * (history_file_size + 1));
+    const size_t written = sprintf(history_file, "%s/.tsh_history", home);
+    if (written != history_file_size) {
+        reset_state_error("Error in history file name.\n");
+        free(history_file);
+        return;
+    }
+
+    /* Open the file */
+    FILE *fp;
+    fp = fopen(history_file, "r");
+    free(history_file);
+    if (fp == NULL) {
+        reset_state_error("Error opening history file.\n");
+        fclose(fp);
+        return;
+    }
+
+    /* Read the file in reverse */
+    fseek(fp, 0, SEEK_END);
+    long pos = ftell(fp);
+    int i = 0;
+    
+    /* Store the commands */
+    char commands[MAXHISTORY][MAXLINE];
+    int command_count = 0;
+    char command[MAXLINE];
+    int command_length = 0;
+
+    /* Add each line to the list of commands */
+    while (i < pos && command_count < MAXHISTORY) {
+        i++;
+        fseek(fp, -i, SEEK_END);
+        char c = fgetc(fp);
+        if (c == '\n' && command_length > 0) {
+            command[command_length] = '\0';
+            strrevr(command, command_length);
+            if (command_count == 0) {
+                command[command_length - 1] = '\0';
+            }
+            strcpy(commands[command_count], command);
+            command_count++;
+            command_length = 0;
+        } else {
+            command[command_length] = c;
+            command_length++;
+        }
+    }
+    if (command_count >= MAXHISTORY) {
+        command_count = MAXHISTORY;
+    } else {
+        command[command_length] = '\0';
+        strrevr(command, command_length);
+        strcpy(commands[command_count], command);
+        command_count++;
+    }
+
+    /* Free memory not used after this */
+    fclose(fp);
+
+    /* Add the commands to the history array */
+    for (int j = command_count - 1; j >= 0; j--) {
+        add_to_history(commands[j]);
+    }
+}
+
+/* show_history - Print the history of commands (Max number of commands printed is set to MAXHISTORY = 10)*/
+void show_history() {
+    /* Most recent command is last */
+    printf("History (last 10 commands used from least to most recent):\n");
+    int count = 1;
+    for (int i = MAXHISTORY - 1; i >= 0; i--) {
+        if (strlen(history[i]) != 0) {
+            printf("%d. %s\n", count, history[i]);
+            count += 1;
+        }
+    }
+}
+
+/* history_length - Number of commands present in the history */
+int history_length() {
+    int count = 0;
+    for (int i = 0; i < MAXHISTORY; i++) {
+        if (strlen(history[i]) == 0) {
+            break;
+        }
+        count += 1;
+    }
+    return count;
+}
+
+/* write_to_history - Write command to history file */
+void write_to_history(char *cmdline) {
+    /* Get the file details */
+    const size_t history_file_size = strlen(home) + 1 + 12; /* Does not include the null terminator */
+    char *history_file = malloc(sizeof(char) * (history_file_size + 1));
+    const size_t written = sprintf(history_file, "%s/.tsh_history", home);
+    if (written != history_file_size) {
+        reset_state_error("Error in history file name.\n");
+        free(history_file);
+        return;
+    }
+
+    /* Open the file */
+    FILE *fp;
+    fp = fopen(history_file, "a");
+
+    /* Free up memory not used */
+    free(history_file);
+
+    if (fp == NULL) {
+        reset_state_error("Error opening history file.\n");
+        fclose(fp);
+        return;
+    }
+
+    /* Write the command to the file as a new line */
+    fprintf(fp, "%s\n", cmdline);
+    fclose(fp);
+    
+    /* Add to history */
+    add_to_history(cmdline);
+}
+
+/* run_nth_history - Run the Nth command in the history file */
+void run_nth_history(char *cmdline) {
+    /* Get the number of the command to run (subtract 1 for 0 indexing) */
+    int n;
+    sscanf(cmdline, "!%d", &n);
+    const int h_length = history_length();
+    if (n > h_length) {
+        sprintf(sbuf, "Called command %d from history, however only %d commands present in history.\n", n, h_length);
+        reset_state_error(sbuf);
+        return;
+    }
+    n -= 1;
+    
+    char command[MAXLINE];
+    strcpy(command, history[n]);
+    /* Add newline to simulate entry by user */
+    strcat(command, "\n");
+    eval(command);
+    return;
+}
+
+/* add_to_history - Add command to history file */
+void add_to_history(char *cmdline) {
+    /* Add to history */
+    bool added = false;
+    for (int i = 0; i < MAXHISTORY; i++) {
+        if (strlen(history[i]) == 0) {
+            strcpy(history[i], cmdline);
+            added = true;
+            break;
+        }
+    }
+
+    /* If the history is full, shift the history down and add the command */
+    if (!added) {
+        for (int i = 0; i < MAXHISTORY - 1; i++) {
+            strcpy(history[i], history[i + 1]);
+        }
+        strcpy(history[MAXHISTORY - 1], cmdline);
+    }
+}
+
+
+/* strrev - Reverse a string (in-place) */
+void strrevr(char *str, const int length) {
+    char c;
+    for (int i = 0; i < length / 2; i++) {  
+        c = str[i];  
+        str[i] = str[length - i - 1];  
+        str[length - i - 1] = c;  
+    }  
+}  
+
 /* 
  * eval - Evaluate the command line that the user has just typed in
  * 
@@ -178,8 +484,51 @@ char * login() {
  * background children don't receive SIGINT (SIGTSTP) from the kernel
  * when we type ctrl-c (ctrl-z) at the keyboard.  
 */
-void eval(char *cmdline) 
-{
+void eval(char *cmdline) {
+    char *argv[MAXARGS]; /* Argument list execve() */
+    char buf[MAXARGS];   /* Holds modified command line */
+    int bg;              /* Should the job run in bg or fg? */
+    pid_t pid;           /* Process id */
+
+    /* Parse the command line */
+    strcpy(buf, cmdline);
+    bg = parseline(buf, argv);
+
+    if (argv[0] == NULL) {
+        return;   /* Ignore empty lines */
+    }
+
+    /* Add command to history and .tsh_history */
+    if (buf[strlen(buf) - 1] == '\n') {
+        buf[strlen(buf) - 1] = '\0';
+    }
+    write_to_history(buf);
+
+    /* Fork child process as job if the command is not a built-in command */
+    if (!builtin_cmd(argv)) {
+        printf("Forking child process as job\n");
+        // if ((pid = fork()) == 0) {   /* Child runs user job */
+        //     if (execve(argv[0], argv, environ) < 0) {
+        //         printf("%s: Command not found.\n", argv[0]);
+        //         exit(0);
+        //     }
+        // }
+
+        // /* Parent waits for foreground job to terminate */
+        // if (!bg) {
+        //     int status;
+        //     if (waitpid(pid, &status, 0) < 0) {
+        //         unix_error("waitfg: waitpid error");
+        //     }
+        // } else {
+        //     printf("%d %s", pid, cmdline);
+        // }
+    } else {
+        /* If the command is a built-in command, execute it immediately in the foreground */
+        exec_builtin(argv);
+    }
+
+
     return;
 }
 
@@ -190,8 +539,7 @@ void eval(char *cmdline)
  * argument.  Return true if the user has requested a BG job, false if
  * the user has requested a FG job.  
  */
-int parseline(const char *cmdline, char **argv) 
-{
+int parseline(const char *cmdline, char **argv) {
     static char array[MAXLINE]; /* holds local copy of command line */
     char *buf = array;          /* ptr that traverses command line */
     char *delim;                /* points to first space delimiter */
@@ -206,37 +554,39 @@ int parseline(const char *cmdline, char **argv)
     /* Build the argv list */
     argc = 0;
     if (*buf == '\'') {
-	buf++;
-	delim = strchr(buf, '\'');
-    }
-    else {
-	delim = strchr(buf, ' ');
+        buf++;
+        delim = strchr(buf, '\'');
+    } else {
+	    delim = strchr(buf, ' ');
     }
 
     while (delim) {
-	argv[argc++] = buf;
-	*delim = '\0';
-	buf = delim + 1;
-	while (*buf && (*buf == ' ')) /* ignore spaces */
+        argv[argc++] = buf;
+        *delim = '\0';
+        buf = delim + 1;
+	    while (*buf && (*buf == ' ')) { /* ignore spaces */
 	       buf++;
+        }
 
-	if (*buf == '\'') {
-	    buf++;
-	    delim = strchr(buf, '\'');
-	}
-	else {
-	    delim = strchr(buf, ' ');
-	}
+        if (*buf == '\'') {
+            buf++;
+            delim = strchr(buf, '\'');
+        } else {
+            delim = strchr(buf, ' ');
+        }
     }
+    
     argv[argc] = NULL;
     
-    if (argc == 0)  /* ignore blank line */
-	return 1;
+    if (argc == 0) {  /* ignore blank line */
+        return 1;
+    }
 
     /* should the job run in the background? */
     if ((bg = (*argv[argc-1] == '&')) != 0) {
-	argv[--argc] = NULL;
+	    argv[--argc] = NULL;
     }
+
     return bg;
 }
 
@@ -244,24 +594,64 @@ int parseline(const char *cmdline, char **argv)
  * builtin_cmd - If the user has typed a built-in command then execute
  *    it immediately.  
  */
-int builtin_cmd(char **argv) 
-{
+int builtin_cmd(char **argv) {
+    /* Built-in commands */
+    const int n_builtins = 7;
+    const char *builtins[n_builtins] = {"quit", "logout", "history", "bg", "fg", "jobs", "adduser"};
+    for (int i = 0; i < n_builtins; i++) {
+        if (strcmp(argv[0], builtins[i]) == 0) {
+            return 1;
+        }
+    }
+    
+    /* Check for !N command */
+    if (argv[0][0] == '!') {
+        for (int i = 1; i < strlen(argv[0]); i++) {
+            if (!isdigit(argv[0][i])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
     return 0;     /* not a builtin command */
+}
+
+/* 
+ * exec_builtin - Execute the built-in command
+ */
+void exec_builtin(char **argv) {
+    if (strcmp(argv[0], "quit") == 0) {
+        quit();
+    } else if (strcmp(argv[0], "logout") == 0) {
+        logout();
+    } else if (strcmp(argv[0], "history") == 0) {
+        show_history();
+    } else if (argv[0][0] == '!') {
+        run_nth_history(argv[0]);
+    } else if (strcmp(argv[0], "bg") == 0) {
+        printf("bg\n");
+    } else if (strcmp(argv[0], "fg") == 0) {
+        printf("fg\n");
+    } else if (strcmp(argv[0], "jobs") == 0) {
+        listjobs(jobs);
+    } else if (strcmp(argv[0], "adduser") == 0) {
+        printf("adduser\n");
+    }
+    return;
 }
 
 /* 
  * do_bgfg - Execute the builtin bg and fg commands
  */
-void do_bgfg(char **argv) 
-{
+void do_bgfg(char **argv) {
     return;
 }
 
 /* 
  * waitfg - Block until process pid is no longer the foreground process
  */
-void waitfg(pid_t pid)
-{
+void waitfg(pid_t pid) {
     return;
 }
 
@@ -276,8 +666,7 @@ void waitfg(pid_t pid)
  *     available zombie children, but doesn't wait for any other
  *     currently running children to terminate.  
  */
-void sigchld_handler(int sig) 
-{
+void sigchld_handler(int sig) {
     return;
 }
 
@@ -286,8 +675,7 @@ void sigchld_handler(int sig)
  *    user types ctrl-c at the keyboard.  Catch it and send it along
  *    to the foreground job.  
  */
-void sigint_handler(int sig) 
-{
+void sigint_handler(int sig) {
     return;
 }
 
@@ -296,8 +684,7 @@ void sigint_handler(int sig)
  *     the user types ctrl-z at the keyboard. Catch it and suspend the
  *     foreground job by sending it a SIGTSTP.  
  */
-void sigtstp_handler(int sig) 
-{
+void sigtstp_handler(int sig) {
     return;
 }
 
@@ -317,6 +704,16 @@ void clearjob(struct job_t *job) {
     job->cmdline[0] = '\0';
 }
 
+/* are_open_jobs - Check if any jobs are left to be completed */
+bool are_open_jobs(struct job_t *jobs) {
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].state != UNDEF) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* initjobs - Initialize the job list */
 void initjobs(struct job_t *jobs) {
     int i;
@@ -326,8 +723,7 @@ void initjobs(struct job_t *jobs) {
 }
 
 /* maxjid - Returns largest allocated job ID */
-int maxjid(struct job_t *jobs) 
-{
+int maxjid(struct job_t *jobs) {
     int i, max=0;
 
     for (i = 0; i < MAXJOBS; i++)
@@ -337,34 +733,35 @@ int maxjid(struct job_t *jobs)
 }
 
 /* addjob - Add a job to the job list */
-int addjob(struct job_t *jobs, pid_t pid, int state, char *cmdline) 
-{
+int addjob(struct job_t *jobs, pid_t pid, int state, char *cmdline) {
     int i;
     
-    if (pid < 1)
-	return 0;
+    if (pid < 1) {
+        return 0;
+    }
 
     for (i = 0; i < MAXJOBS; i++) {
-	if (jobs[i].pid == 0) {
-	    jobs[i].pid = pid;
-	    jobs[i].state = state;
-	    jobs[i].jid = nextjid++;
-	    if (nextjid > MAXJOBS)
-		nextjid = 1;
-	    strcpy(jobs[i].cmdline, cmdline);
-  	    if(verbose){
-	        printf("Added job [%d] %d %s\n", jobs[i].jid, jobs[i].pid, jobs[i].cmdline);
+        if (jobs[i].pid == 0) {
+            jobs[i].pid = pid;
+            jobs[i].state = state;
+            jobs[i].jid = nextjid++;
+            if (nextjid > MAXJOBS) {
+                nextjid = 1;
+            }
+            strcpy(jobs[i].cmdline, cmdline);
+            if(verbose){
+                printf("Added job [%d] %d %s\n", jobs[i].jid, jobs[i].pid, jobs[i].cmdline);
             }
             return 1;
-	}
+        }
     }
+
     printf("Tried to create too many jobs\n");
     return 0;
 }
 
 /* deletejob - Delete a job whose PID=pid from the job list */
-int deletejob(struct job_t *jobs, pid_t pid) 
-{
+int deletejob(struct job_t *jobs, pid_t pid) {
     int i;
 
     if (pid < 1)
@@ -403,8 +800,7 @@ struct job_t *getjobpid(struct job_t *jobs, pid_t pid) {
 }
 
 /* getjobjid  - Find a job (by JID) on the job list */
-struct job_t *getjobjid(struct job_t *jobs, int jid) 
-{
+struct job_t *getjobjid(struct job_t *jobs, int jid) {
     int i;
 
     if (jid < 1)
@@ -416,43 +812,41 @@ struct job_t *getjobjid(struct job_t *jobs, int jid)
 }
 
 /* pid2jid - Map process ID to job ID */
-int pid2jid(pid_t pid) 
-{
+int pid2jid(pid_t pid) {
     int i;
 
     if (pid < 1)
 	return 0;
     for (i = 0; i < MAXJOBS; i++)
 	if (jobs[i].pid == pid) {
-            return jobs[i].jid;
-        }
+        return jobs[i].jid;
+    }
     return 0;
 }
 
 /* listjobs - Print the job list */
-void listjobs(struct job_t *jobs) 
-{
+void listjobs(struct job_t *jobs) {
     int i;
     
     for (i = 0; i < MAXJOBS; i++) {
-	if (jobs[i].pid != 0) {
-	    printf("[%d] (%d) ", jobs[i].jid, jobs[i].pid);
-	    switch (jobs[i].state) {
-		case BG: 
-		    printf("Running ");
-		    break;
-		case FG: 
-		    printf("Foreground ");
-		    break;
-		case ST: 
-		    printf("Stopped ");
-		    break;
-	    default:
-		    printf("listjobs: Internal error: job[%d].state=%d ", 
-			   i, jobs[i].state);
-	    }
-	    printf("%s", jobs[i].cmdline);
-	}
+        if (jobs[i].pid != 0) {
+            printf("[%d] (%d) ", jobs[i].jid, jobs[i].pid);
+            switch (jobs[i].state) {
+            case BG: 
+                printf("Running ");
+                break;
+            case FG: 
+                printf("Foreground ");
+                break;
+            case ST: 
+                printf("Stopped ");
+                break;
+            default:
+                printf("listjobs: Internal error: job[%d].state=%d ", 
+                i, jobs[i].state);
+            }
+            printf("%s", jobs[i].cmdline);
+        }
     }
 }
 /******************************
@@ -467,8 +861,7 @@ void listjobs(struct job_t *jobs)
 /*
  * usage - print a help message
  */
-void usage(void) 
-{
+void usage(void) {
     printf("Usage: shell [-hvp]\n");
     printf("   -h   print this message\n");
     printf("   -v   print additional diagnostic information\n");
@@ -479,8 +872,7 @@ void usage(void)
 /*
  * unix_error - unix-style error routine
  */
-void unix_error(char *msg)
-{
+void unix_error(char *msg) {
     fprintf(stdout, "%s: %s\n", msg, strerror(errno));
     exit(1);
 }
@@ -488,17 +880,22 @@ void unix_error(char *msg)
 /*
  * app_error - application-style error routine
  */
-void app_error(char *msg)
-{
+void app_error(char *msg) {
     fprintf(stdout, "%s\n", msg);
     exit(1);
 }
 
 /*
+* reset_state_error - reset the state of the shell
+*/
+void reset_state_error(char *msg) {
+    fprintf(stdout, "%s\n", msg);
+}
+
+/*
  * Signal - wrapper for the sigaction function
  */
-handler_t *Signal(int signum, handler_t *handler) 
-{
+handler_t *Signal(int signum, handler_t *handler) {
     struct sigaction action, old_action;
 
     action.sa_handler = handler;  
@@ -514,8 +911,7 @@ handler_t *Signal(int signum, handler_t *handler)
  * sigquit_handler - The driver program can gracefully terminate the
  *    child shell by sending it a SIGQUIT signal.
  */
-void sigquit_handler(int sig) 
-{
+void sigquit_handler(int sig) {
     printf("Terminating after receipt of SIGQUIT signal\n");
     exit(1);
 }
