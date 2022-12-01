@@ -293,15 +293,11 @@ void quit() {
 
 /* logout - Logout of the shell */
 void logout() {
-    /* Free memory not used after this */
-    free(home);
-    free(username);
-
     /* Check if any jobs are remaining */
     if (are_open_jobs(jobs)) {
         user_error("There are suspended jobs.");
     } else {
-        exit(0);
+        quit();
     }
 }
 
