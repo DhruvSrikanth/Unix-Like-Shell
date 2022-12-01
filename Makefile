@@ -4,6 +4,9 @@ GCC = gcc
 # Standard:
 STD = gnu11
 
+# Home:
+ROOT = home/root
+
 # User flags:
 # -h   print this message
 # -v   print additional diagnostic information
@@ -11,13 +14,19 @@ STD = gnu11
 
 
 # Recipes:
-shell: run_shell remove_shell_executable
+shell: run remove_exe
 
-compile_shell: ./tsh.c
+compile: ./tsh.c
 	$(GCC) -std=$(STD) -o tsh ./tsh.c
 
-remove_shell_executable: ./tsh
+remove_exe: ./tsh
 	rm ./tsh
 
-run_shell: compile_shell
+run: compile
 	./tsh
+
+reset: remove_exe
+	rm -rf $(ROOT)/*
+	mkdir $(ROOT)
+	touch $(ROOT)/.tsh_history
+	clear

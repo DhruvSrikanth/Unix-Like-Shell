@@ -84,28 +84,37 @@ struct job_t *getjobpid(struct job_t *jobs, pid_t pid);
 struct job_t *getjobjid(struct job_t *jobs, int jid); 
 int pid2jid(pid_t pid); 
 void listjobs(struct job_t *jobs);
+
 char *login();
 void usage(void);
+
 void unix_error(char *msg);
 void app_error(char *msg);
 void reset_state_error(char *msg);
 void user_error(char *msg);
+
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
 
 /* Additional helper functions */
 void authenticate(const char *username, const char *password, bool *authenticated);
+
 void exec_builtin(char **argv);
+
 bool are_open_jobs(struct job_t *jobs);
+
 void quit();
 void logout();
 void add_user(char *user_name, char *pwd);
+bool user_exists(char *user_name);
+
 void init_history();
 void show_history();
 int history_length();
 void add_to_history(char *cmd);
 void write_to_history(char *cmd);
 void run_nth_history(char *cmd);
+
 void strrevr(char *str, const int length);
 
 
@@ -307,7 +316,13 @@ void add_user(char *user_name, char *pwd) {
 
     /* Only allow the root user to add new users */
     if (strcmp(username, "root") != 0) {
-        sprintf(sbuf, "Only the root user can add new users. Logged in as %s.", username);
+        user_error("root privileges required to run adduser.");
+        return;
+    }
+
+    /* Check if user already exists */
+    if (user_exists(user_name)) {
+        sprintf(sbuf, "User %s may already exist.", user_name);
         user_error(sbuf);
         return;
     }
@@ -345,6 +360,35 @@ void add_user(char *user_name, char *pwd) {
 
 
     fclose(fp);
+}
+
+bool user_exists(char *user_name) {
+    /* Open the file */
+    FILE *fp;
+    fp = fopen("etc/passwd", "r");
+    if (fp == NULL) {
+        reset_state_error("Could not open etc/passwd file.");
+        fclose(fp);
+        return false;
+    }
+
+    /* Read the file one line at a time comparing username */
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read;
+    while ((read = getline(&line, &len, fp)) != -1) {
+        char *token = strtok(line, ":");
+        if (strcmp(token, user_name) == 0) {
+            free(line);
+            fclose(fp);
+            return true;
+        }
+    }
+
+    /* Free memory not used after this */
+    free(line);
+    fclose(fp);
+    return false;
 }
 
 /* init_history - Initialize the history array with the user's previous commands */
@@ -598,8 +642,9 @@ int parseline(const char *cmdline, char **argv) {
 
     strcpy(buf, cmdline);
     buf[strlen(buf)-1] = ' ';  /* replace trailing '\n' with space */
-    while (*buf && (*buf == ' ')) /* ignore leading spaces */
-	buf++;
+    while (*buf && (*buf == ' ')) { /* ignore leading spaces */
+        buf++;
+    }
 
     /* Build the argv list */
     argc = 0;
@@ -688,7 +733,6 @@ void exec_builtin(char **argv) {
     } else if (strcmp(argv[0], "adduser") == 0) {
         add_user(argv[1], argv[2]);
     }
-    return;
 }
 
 /* 
