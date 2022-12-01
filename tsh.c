@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
@@ -20,6 +21,7 @@
 #define MAXJOBS      16   /* max jobs at any point in time */
 #define MAXJID    1<<16   /* max job ID */
 #define MAXHISTORY  10   /* max history size */
+#define MKDIR_MODE  0700 /* mkdir mode */
 
 /* Job states */
 #define UNDEF 0 /* undefined */
@@ -87,6 +89,7 @@ void usage(void);
 void unix_error(char *msg);
 void app_error(char *msg);
 void reset_state_error(char *msg);
+void user_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
 
@@ -96,12 +99,13 @@ void exec_builtin(char **argv);
 bool are_open_jobs(struct job_t *jobs);
 void quit();
 void logout();
+void add_user(char *user_name, char *pwd);
 void init_history();
 void show_history();
 int history_length();
-void add_to_history(char *cmdline);
-void write_to_history(char *cmdline);
-void run_nth_history(char *cmdline);
+void add_to_history(char *cmd);
+void write_to_history(char *cmd);
+void run_nth_history(char *cmd);
 void strrevr(char *str, const int length);
 
 
@@ -222,7 +226,7 @@ char *login() {
 
         /* Try again if information is incorrect otherwise return password */
         if (!authenticated) {
-            reset_state_error("User Authentication failed. Please try again.");
+            user_error("User Authentication failed. Please try again.");
         } else {
             return username;
         }
@@ -237,7 +241,7 @@ void authenticate(const char *username, const char *password, bool *authenticate
     FILE *fp;
     fp = fopen("etc/passwd", "r");
     if (fp == NULL) {
-        reset_state_error("Error opening file.\n");
+        reset_state_error("Could not open etc/passwd file.");
         fclose(fp);
         return;
     }
@@ -286,10 +290,61 @@ void logout() {
 
     /* Check if any jobs are remaining */
     if (are_open_jobs(jobs)) {
-        reset_state_error("There are suspended jobs.\n");
+        user_error("There are suspended jobs.");
     } else {
         exit(0);
     }
+}
+
+/* add_user - Add user to the system */
+void add_user(char *user_name, char *pwd) {
+    /* Check if username and password are valid */
+    if (user_name == NULL || pwd == NULL || strlen(user_name) == 0 || strlen(pwd) == 0) {
+        sprintf(sbuf, "Invalid username (%s) or password(%s) provided.", user_name, pwd);
+        user_error(sbuf);
+        return;
+    }
+
+    /* Only allow the root user to add new users */
+    if (strcmp(username, "root") != 0) {
+        sprintf(sbuf, "Only the root user can add new users. Logged in as %s.", username);
+        user_error(sbuf);
+        return;
+    }
+
+
+    /* Create new user directory */
+    sprintf(sbuf, "home/%s", user_name);
+    if (mkdir(sbuf, MKDIR_MODE) == -1) {
+        reset_state_error("Could not create user directory.");
+    }
+
+    /* Create .tsh_history file */
+    sprintf(sbuf, "home/%s/.tsh_history", user_name);
+    FILE *fp;
+    fp = fopen(sbuf, "w");
+    if (fp == NULL) {
+        reset_state_error("Could not create .tsh_history file.");
+    }
+    fclose(fp);
+
+    
+    /* Write to etc/passwd file */
+    fp = fopen("etc/passwd", "a");
+    if (fp == NULL) {
+        reset_state_error("Could not open etc/passwd file.");
+        fclose(fp);
+        return;
+    }
+
+    sprintf(sbuf, "home/%s", user_name);
+    const size_t written = fprintf(fp, "%s:%s:%s\n", user_name, pwd, sbuf);
+    if (written != strlen(user_name) + strlen(pwd) + strlen(sbuf) + 3) {
+        reset_state_error("Could not write to etc/passwd file.");
+    }
+
+
+    fclose(fp);
 }
 
 /* init_history - Initialize the history array with the user's previous commands */
@@ -297,19 +352,15 @@ void init_history() {
     /* Get the file details */
     const size_t history_file_size = strlen(home) + 1 + 12; /* Does not include the null terminator */
     char *history_file = malloc(sizeof(char) * (history_file_size + 1));
-    const size_t written = sprintf(history_file, "%s/.tsh_history", home);
-    if (written != history_file_size) {
-        reset_state_error("Error in history file name.\n");
-        free(history_file);
-        return;
-    }
+    sprintf(history_file, "%s/.tsh_history", home);
 
     /* Open the file */
     FILE *fp;
     fp = fopen(history_file, "r");
     free(history_file);
     if (fp == NULL) {
-        reset_state_error("Error opening history file.\n");
+        sprintf(sbuf, "Could not open %s/.tsh_history file.", home);
+        reset_state_error(sbuf);
         fclose(fp);
         return;
     }
@@ -388,16 +439,11 @@ int history_length() {
 }
 
 /* write_to_history - Write command to history file */
-void write_to_history(char *cmdline) {
+void write_to_history(char *cmd) {
     /* Get the file details */
     const size_t history_file_size = strlen(home) + 1 + 12; /* Does not include the null terminator */
     char *history_file = malloc(sizeof(char) * (history_file_size + 1));
-    const size_t written = sprintf(history_file, "%s/.tsh_history", home);
-    if (written != history_file_size) {
-        reset_state_error("Error in history file name.\n");
-        free(history_file);
-        return;
-    }
+    sprintf(history_file, "%s/.tsh_history", home);
 
     /* Open the file */
     FILE *fp;
@@ -407,32 +453,36 @@ void write_to_history(char *cmdline) {
     free(history_file);
 
     if (fp == NULL) {
-        reset_state_error("Error opening history file.\n");
+        sprintf(sbuf, "Could not open %s/.tsh_history file.", home);
+        reset_state_error(sbuf);
         fclose(fp);
         return;
     }
 
     /* Write the command to the file as a new line */
-    fprintf(fp, "%s\n", cmdline);
+    const size_t written = fprintf(fp, "%s\n", cmd);
+    if (written != strlen(cmd) + 1) {
+        reset_state_error("Could not write to history file.");
+    }
     fclose(fp);
     
     /* Add to history */
-    add_to_history(cmdline);
+    add_to_history(cmd);
 }
 
 /* run_nth_history - Run the Nth command in the history file */
-void run_nth_history(char *cmdline) {
+void run_nth_history(char *cmd) {
     /* Get the number of the command to run (subtract 1 for 0 indexing) */
     int n;
-    sscanf(cmdline, "!%d", &n);
+    sscanf(cmd, "!%d", &n);
     const int h_length = history_length();
     if (n > h_length) {
-        sprintf(sbuf, "Called command %d from history, however only %d commands present in history.\n", n, h_length);
+        sprintf(sbuf, "Called command %d from history, however only %d commands present in history.", n, h_length);
         reset_state_error(sbuf);
         return;
     }
     n -= 1;
-    
+
     char command[MAXLINE];
     strcpy(command, history[n]);
     /* Add newline to simulate entry by user */
@@ -442,12 +492,12 @@ void run_nth_history(char *cmdline) {
 }
 
 /* add_to_history - Add command to history file */
-void add_to_history(char *cmdline) {
+void add_to_history(char *cmd) {
     /* Add to history */
     bool added = false;
     for (int i = 0; i < MAXHISTORY; i++) {
         if (strlen(history[i]) == 0) {
-            strcpy(history[i], cmdline);
+            strcpy(history[i], cmd);
             added = true;
             break;
         }
@@ -458,7 +508,7 @@ void add_to_history(char *cmdline) {
         for (int i = 0; i < MAXHISTORY - 1; i++) {
             strcpy(history[i], history[i + 1]);
         }
-        strcpy(history[MAXHISTORY - 1], cmdline);
+        strcpy(history[MAXHISTORY - 1], cmd);
     }
 }
 
@@ -471,7 +521,7 @@ void strrevr(char *str, const int length) {
         str[i] = str[length - i - 1];  
         str[length - i - 1] = c;  
     }  
-}  
+} 
 
 /* 
  * eval - Evaluate the command line that the user has just typed in
@@ -613,7 +663,7 @@ int builtin_cmd(char **argv) {
         }
         return 1;
     }
-
+    
     return 0;     /* not a builtin command */
 }
 
@@ -636,7 +686,7 @@ void exec_builtin(char **argv) {
     } else if (strcmp(argv[0], "jobs") == 0) {
         listjobs(jobs);
     } else if (strcmp(argv[0], "adduser") == 0) {
-        printf("adduser\n");
+        add_user(argv[1], argv[2]);
     }
     return;
 }
@@ -889,6 +939,11 @@ void app_error(char *msg) {
 * reset_state_error - reset the state of the shell
 */
 void reset_state_error(char *msg) {
+    fprintf(stdout, "Error: %s\n", msg);
+}
+
+/* user_error - Raised when user makes error */
+void user_error(char *msg) {
     fprintf(stdout, "%s\n", msg);
 }
 
