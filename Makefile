@@ -26,6 +26,7 @@ run: compile
 	./tsh
 
 reset: remove_exe
+	@rm -rf proc/*
 	@rm -rf $(ROOT)/*
 	@mkdir $(ROOT)
 	@touch $(ROOT)/.tsh_history

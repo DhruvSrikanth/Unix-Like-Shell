@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <dirent.h>
 
 /* Misc manifest constants */
 #define MAXLINE    1024  /* max line size */
@@ -24,6 +25,8 @@
 #define MKDIR_MODE  0700 /* mkdir mode */
 #define EXIT_SUCCESS 0   /* exit success */
 #define EXIT_FAILURE 1   /* exit failure */
+#define LOGIN_SUCCESS 0  /* login success */
+#define LOGIN_FAILURE 1  /* login failure */
 
 /* Job states */
 #define UNDEF 0 /* undefined */
@@ -56,7 +59,19 @@ struct job_t {              /* The job struct */
     char cmdline[MAXLINE];  /* command line */
 };
 struct job_t jobs[MAXJOBS]; /* The job list */
+
+struct stat_t {
+    char name[MAXLINE];     /* name of the command */
+    pid_t pid;              /* process id */
+    pid_t ppid;             /* parent process id */
+    pid_t pgid;             /* process group id */
+    pid_t sid;              /* session id */
+    char state[MAXLINE];     /* state of the process */
+    char uname[MAXLINE];    /* user name */
+};
+
 char history[MAXHISTORY][MAXLINE];  /* The history list */
+pid_t session_id;                   /* The session id of the shell */
 volatile sig_atomic_t pid_buf;     
 /* End global variables */
 
@@ -106,8 +121,8 @@ void exec_builtin(char **argv);
 
 bool are_open_jobs(struct job_t *jobs);
 
-void quit(char *cmd);
-void logout(char *cmd);
+void quit(int sig);
+void logout(int sig);
 void add_user(char *user_name, char *pwd);
 bool user_exists(char *user_name);
 
@@ -117,7 +132,19 @@ int history_length();
 void add_to_history(char *cmd);
 void write_to_history(char *cmd);
 void run_nth_history(char *cmd);
+void reset_history();
 
+void shell_stat(struct stat_t *stat);
+void make_stat(struct stat_t *stat, pid_t pid, char *cmd);
+
+void create_proc_entry(struct stat_t *stat);
+void write_proc_entry(struct stat_t *stat);
+void read_proc_entry(struct stat_t *stat, pid_t pid);
+void edit_proc_entry(pid_t pid, char *new_state);
+void remove_proc_entry(pid_t pid);
+void remove_proc_entries();
+
+bool isnum(char *str);
 void strrevr(char *str, const int length);
 
 /*
@@ -168,6 +195,10 @@ int main(int argc, char **argv) {
     /* Initialize the history of commands used previously by the user */
     init_history();
 
+    /* Create entry proc/PID/status for shell */
+    struct stat_t stat;
+    shell_stat(&stat);
+    create_proc_entry(&stat);
     
     /* Execute the shell's read/eval loop */
     bool just_logged_in = true;
@@ -199,6 +230,7 @@ int main(int argc, char **argv) {
 
     free(username);
     free(home);
+    remove_proc_entries();
     exit(EXIT_SUCCESS); /* control never reaches here */
 
 }
@@ -220,9 +252,7 @@ char *login() {
         scanf("%s", username);
 
         if (strcmp(username, "quit") == 0) {
-            free(home);
-            free(username);
-            exit(EXIT_SUCCESS);
+            quit(LOGIN_FAILURE);
         }
         
         printf("password: ");
@@ -286,9 +316,17 @@ void authenticate(const char *username, const char *password, bool *authenticate
 }
 
 /* quit - Quit the shell */
-void quit(char *cmd) {
-    /* Write command */
-    write_to_history(cmd);
+void quit(int sig) {
+    if (sig == LOGIN_SUCCESS) {
+        /* Reset the history */
+        reset_history();
+    }
+
+    /* Remove session proc entry */
+    remove_proc_entry(session_id);
+
+    /* Remove all proc entries */
+    remove_proc_entries();
 
     /* Free memory not used after this */
     free(home);
@@ -297,12 +335,12 @@ void quit(char *cmd) {
 }
 
 /* logout - Logout of the shell */
-void logout(char *cmd) {
+void logout(int sig) {
     /* Check if any jobs are remaining */
     if (are_open_jobs(jobs)) {
         user_error("There are suspended jobs.");
     } else {
-        quit(cmd);
+        quit(sig);
     }
 }
 
@@ -363,6 +401,7 @@ void add_user(char *user_name, char *pwd) {
     fclose(fp);
 }
 
+/* user_exitsts - check if a user exists in etc/passwd */
 bool user_exists(char *user_name) {
     /* Open the file */
     FILE *fp;
@@ -462,11 +501,9 @@ void init_history() {
 void show_history() {
     /* Most recent command is last */
     printf("History (last 10 commands used from least to most recent):\n");
-    int count = 1;
-    for (int i = MAXHISTORY - 1; i >= 0; i--) {
+    for (int i = 0; i < MAXHISTORY; i++) {
         if (strlen(history[i]) != 0) {
-            printf("%d. %s\n", count, history[i]);
-            count += 1;
+            printf("%d. %s\n", i + 1, history[i]);
         }
     }
 }
@@ -485,6 +522,16 @@ int history_length() {
 
 /* write_to_history - Write command to history file */
 void write_to_history(char *cmd) {
+    /* Preprocess the command */
+    if (cmd[strlen(cmd) - 1] == '\n') {
+        cmd[strlen(cmd) - 1] = '\0';
+    }
+    
+    /* Check for ! since it should not be written */
+    if (cmd[0] == '!') {
+        return;
+    }
+
     /* Get the file details */
     const size_t history_file_size = strlen(home) + 1 + 12; /* Does not include the null terminator */
     char *history_file = malloc(sizeof(char) * (history_file_size + 1));
@@ -561,6 +608,205 @@ void add_to_history(char *cmd) {
     }
 }
 
+/* reset_history - Reset the .tsh_history file */
+void reset_history() {
+    /* Get the file details */
+    const size_t history_file_size = strlen(home) + 1 + 12; /* Does not include the null terminator */
+    char *history_file = malloc(sizeof(char) * (history_file_size + 1));
+    sprintf(history_file, "%s/.tsh_history", home);
+
+    /* Open the file */
+    FILE *fp;
+    fp = fopen(history_file, "w");
+
+    /* Free up memory not used */
+    free(history_file);
+
+    if (fp == NULL) {
+        sprintf(sbuf, "Could not open %s/.tsh_history file.", home);
+        reset_state_error(sbuf);
+        fclose(fp);
+        return;
+    }
+
+    /* Write all history commands to the file as a new line */
+    size_t written;
+    for (int i = 0; i < MAXHISTORY; i++) {
+        if (strlen(history[i]) != 0) {
+            written = fprintf(fp, "%s\n", history[i]);
+            if (written != strlen(history[i]) + 1) {
+                reset_state_error("Could not write to history file.");
+            }
+        }
+    }
+    fclose(fp);
+}
+
+/* shell_stat - Create shell stat struct */
+void shell_stat(struct stat_t *stat) {
+    strcpy(stat->name, "tsh");
+    stat->pid = getpid();
+    stat->ppid = getppid();
+    stat->pgid = stat->pid;
+    stat->sid = stat->pid;
+    strcpy(stat->state, "Rs");
+    strcpy(stat->uname, username);
+
+    session_id = stat->sid;
+}
+
+/* get_stat - Create stat struct for process */
+void get_stat(struct stat_t *stat, pid_t pid, char *cmd) {
+    /* Get the process details */
+    strcpy(stat->name, cmd);
+    stat->pid = pid;
+    stat->ppid = getppid();
+    stat->pgid = getpgid(pid);
+    stat->sid = session_id;
+    strcpy(stat->state, "Ss");
+    strcpy(stat->uname, username);
+}
+
+/* write_to_proc - Write to proc/PID/status */
+void create_proc_entry(struct stat_t *stat) {
+    /* Get the folder details */
+    char proc_dir[MAXLINE];
+    sprintf(proc_dir, "proc/%d", stat->pid);
+
+    /* Create the folder */
+    if (mkdir(proc_dir, MKDIR_MODE) == -1) {
+        sprintf(sbuf, "Could not create folder %s.", proc_dir);
+        reset_state_error(sbuf);
+        return;
+    }
+
+    /* Write to the file */
+    write_proc_entry(stat);
+}
+
+/* write_proc_entry - Write to proc/PID/status */
+void write_proc_entry(struct stat_t *stat) {
+    /* Get the file details */
+    char proc_file[MAXLINE];
+    sprintf(proc_file, "proc/%d/status", stat->pid);
+
+    /* Open the file */
+    FILE *fp;
+    fp = fopen(proc_file, "w");
+    if (fp == NULL) {
+        sprintf(sbuf, "Could not open %s file.", proc_file);
+        reset_state_error(sbuf);
+        fclose(fp);
+        return;
+    }
+
+    sprintf(sbuf, "Name: %s\nPid: %d\nPPid: %d\nPGid: %d\nSid: %d\nSTAT: %s\nUsername: %s\n", stat->name, stat->pid, stat->ppid, stat->pgid, stat->sid, stat->state, stat->uname);
+    const size_t written = fprintf(fp, "%s", sbuf);
+    if (written != strlen(sbuf)) {
+        reset_state_error("Could not write to proc/PID/status file.");
+    }
+    fclose(fp);
+}
+    
+/* read_proc_entry - Read proc entrt in proc/PID/status */
+void read_proc_entry(struct stat_t *stat, pid_t pid) {
+    /* Get the file details */
+    char proc_file[MAXLINE];
+    sprintf(proc_file, "proc/%d/status", pid);
+
+    /* Open the file */
+    FILE *fp;
+    fp = fopen(proc_file, "r");
+    if (fp == NULL) {
+        sprintf(sbuf, "Could not open %s file.", proc_file);
+        reset_state_error(sbuf);
+        fclose(fp);
+        return;
+    }
+
+    /* Read the file */
+    fscanf(fp, "Name: %s\nPid: %d\nPPid: %d\nPGid: %d\nSid: %d\nSTAT: %s\nUsername: %s\n", stat->name, &stat->pid, &stat->ppid, &stat->pgid, &stat->sid, stat->state, stat->uname);
+    fclose(fp);
+}
+
+/* edit_proc_entry - Edit proc entry in proc/PID/status */
+void edit_proc_entry(pid_t pid, char *new_state) {
+    /* Get the file details */
+    char proc_file[MAXLINE];
+    sprintf(proc_file, "proc/%d/status", pid);
+
+    /* Read the current files contents into a stat struct */
+    struct stat_t stat;
+    read_proc_entry(&stat, pid);
+
+    /* Edit the state */
+    strcpy(stat.state, new_state);
+
+    /* Write the new state to the file */
+    write_proc_entry(&stat);
+}
+
+/* remove_proc_entry - Remove a specific proc entry in proc/PID/status */
+void remove_proc_entry(pid_t pid) {
+    /* Get the file details */
+    char proc_file[MAXLINE];
+    sprintf(proc_file, "proc/%d/status", pid);
+
+    /* Remove the file */
+    if (remove(proc_file) == -1) {
+        sprintf(sbuf, "Could not remove %s file.", proc_file);
+        reset_state_error(sbuf);
+        return;
+    }
+
+    /* Remove the folder */
+    char proc_dir[MAXLINE];
+    sprintf(proc_dir, "proc/%d", pid);
+    if (rmdir(proc_dir) == -1) {
+        sprintf(sbuf, "Could not remove %s folder.", proc_dir);
+        reset_state_error(sbuf);
+        return;
+    }
+}
+
+/* remove_proc_entries - Remove all proc entries in proc/PID/status */
+void remove_proc_entries() {
+    /* Get the folder details */
+    char proc_dir[MAXLINE];
+    sprintf(proc_dir, "proc");
+
+    /* Get all pids in proc/ */
+    struct dirent *de;
+    DIR *dr = opendir(proc_dir);
+    if (dr == NULL) {
+        sprintf(sbuf, "Could not open %s folder.", proc_dir);
+        reset_state_error(sbuf);
+        return;
+    }
+
+    while ((de = readdir(dr)) != NULL) {
+        /* Check if the file is a directory */
+        if (de->d_type == DT_DIR) {
+            /* Check if the directory is a pid */
+            if (isnum(de->d_name)) {
+                /* Remove the proc entry */
+                remove_proc_entry(atoi(de->d_name));
+            }
+        }
+    }
+
+    closedir(dr);
+}
+
+/* isnum - Check whether a string is a number */
+bool isnum(char *str) {
+    for (int i = 0; i < strlen(str); i++) {
+        if (!isdigit(str[i])) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /* strrev - Reverse a string (in-place) */
 void strrevr(char *str, const int length) {
@@ -597,37 +843,42 @@ void eval(char *cmdline) {
         return;   /* Ignore empty lines */
     }
 
+    /* Add command to history and .tsh_history */
+    write_to_history(buf);
+
     /* Fork child process as job if the command is not a built-in command */
     if (!builtin_cmd(argv)) {
-        printf("Forking child process as job for command - %s", buf);
-        // if ((pid = fork()) == 0) {   /* Child runs user job */
-        //     if (execve(argv[0], argv, environ) < 0) {
-        //         printf("%s: Command not found.\n", argv[0]);
-        //         exit(0);
-        //     }
-        // }
+        if ((pid = fork()) == 0) {   /* Child runs user job */
+            /* Set the process group ID */
+            if (setpgid(0, 0) == -1) {
+                reset_state_error("Could not set process group ID.");
+            }
 
-        // /* Parent waits for foreground job to terminate */
-        // if (!bg) {
-        //     int status;
-        //     if (waitpid(pid, &status, 0) < 0) {
-        //         unix_error("waitfg: waitpid error");
-        //     }
-        // } else {
-        //     printf("%d %s", pid, cmdline);
-        // }
+            /* Write to proc/PID/status */
+            struct stat_t stat;
+            get_stat(&stat, getpid(), argv[0]);
+            create_proc_entry(&stat);
+
+            /* Execute the command */
+            if (execve(argv[0], argv, environ) < 0) {
+                printf("%s: Command not found.\n", argv[0]);
+                exit(EXIT_SUCCESS);
+            }
+        }
+
+        /* Parent waits for foreground job to terminate */
+        if (!bg) {
+            int status;
+            if (waitpid(pid, &status, 0) < 0) {
+                unix_error("waitfg: waitpid error");
+            }
+        } else {
+            printf("%d %s", pid, cmdline);
+        }
     } else {
         /* If the command is a built-in command, execute it immediately in the foreground */
         exec_builtin(argv);
     }
-
-    /* Add command to history and .tsh_history */
-    if (buf[strlen(buf) - 1] == '\n') {
-        buf[strlen(buf) - 1] = '\0';
-    }
-    write_to_history(buf);
-
-
     return;
 }
 
@@ -722,13 +973,9 @@ int builtin_cmd(char **argv) {
  */
 void exec_builtin(char **argv) {
     if (strcmp(argv[0], "quit") == 0) {
-        char cmd[MAXLINE];
-        strcpy(cmd, "quit");
-        quit(cmd);
+        quit(LOGIN_SUCCESS);
     } else if (strcmp(argv[0], "logout") == 0) {
-        char cmd[MAXLINE];
-        strcpy(cmd, "logout");
-        logout(cmd);
+        logout(LOGIN_SUCCESS);
     } else if (strcmp(argv[0], "history") == 0) {
         show_history();
     } else if (argv[0][0] == '!') {
@@ -770,34 +1017,35 @@ void waitfg(pid_t pid) {
  *     currently running children to terminate.  
  */
 void sigchld_handler(int sig) {
-    if (sig == SIGCHLD) {
-        int olderrno = errno;
-        sigset_t mask_all, prev_all;
-        pid_t pid;
-        int status;
-        sigfillset(&mask_all);
-        while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) { /* Reap all children */
-            /* Block all signals */
-            sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+    // if (sig == SIGCHLD) {
+    //     int olderrno = errno;
+    //     sigset_t mask_all, prev_all;
+    //     pid_t pid;
+    //     int status;
+    //     sigfillset(&mask_all);
+    //     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) { /* Reap all children */
+    //         /* Block all signals */
+    //         sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
 
-            /* Did the child process exit normally */
-            if (WIFEXITED(status)) {
-                deletejob(jobs, pid);
-            } else if (WIFSIGNALED(status)) { /* Was the child process signalled to exit */
-                deletejob(jobs, pid);
-            } else if (WIFSTOPPED(status)) { /*Was the child process stopped and if so, maintain the job but update the state */
-                getjobpid(jobs, pid)->state = ST;
-            }
+    //         /* Did the child process exit normally */
+    //         if (WIFEXITED(status)) {
+    //             deletejob(jobs, pid);
+    //         } else if (WIFSIGNALED(status)) { /* Was the child process signalled to exit */
+    //             deletejob(jobs, pid);
+    //         } else if (WIFSTOPPED(status)) { /*Was the child process stopped and if so, maintain the job but update the state */
+    //             getjobpid(jobs, pid)->state = ST;
+    //         }
 
-            /* Unblock all signals */
-            sigprocmask(SIG_SETMASK, &prev_all, NULL);
-        }
+    //         /* Unblock all signals */
+    //         sigprocmask(SIG_SETMASK, &prev_all, NULL);
+    //     }
 
-        if (errno != ECHILD) {
-            unix_error("waitpid error");
-        }
-        errno = olderrno;
-    }
+    //     if (errno != ECHILD) {
+    //         unix_error("waitpid error");
+    //     }
+    //     errno = olderrno;
+    // }
+    return;
 }
 
 /* 
@@ -1018,7 +1266,7 @@ void usage(void) {
  */
 void unix_error(char *msg) {
     fprintf(stdout, "%s: %s\n", msg, strerror(errno));
-    exit(1);
+    exit(EXIT_FAILURE);
 }
 
 /*
