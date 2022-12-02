@@ -16,12 +16,14 @@
 #include <errno.h>
 
 /* Misc manifest constants */
-#define MAXLINE    1024   /* max line size */
-#define MAXARGS     128   /* max args on a command line */
-#define MAXJOBS      16   /* max jobs at any point in time */
-#define MAXJID    1<<16   /* max job ID */
+#define MAXLINE    1024  /* max line size */
+#define MAXARGS     128  /* max args on a command line */
+#define MAXJOBS      16  /* max jobs at any point in time */
+#define MAXJID    1<<16  /* max job ID */
 #define MAXHISTORY  10   /* max history size */
 #define MKDIR_MODE  0700 /* mkdir mode */
+#define EXIT_SUCCESS 0   /* exit success */
+#define EXIT_FAILURE 1   /* exit failure */
 
 /* Job states */
 #define UNDEF 0 /* undefined */
@@ -55,6 +57,7 @@ struct job_t {              /* The job struct */
 };
 struct job_t jobs[MAXJOBS]; /* The job list */
 char history[MAXHISTORY][MAXLINE];  /* The history list */
+volatile sig_atomic_t pid_buf;     
 /* End global variables */
 
 
@@ -103,8 +106,8 @@ void exec_builtin(char **argv);
 
 bool are_open_jobs(struct job_t *jobs);
 
-void quit();
-void logout();
+void quit(char *cmd);
+void logout(char *cmd);
 void add_user(char *user_name, char *pwd);
 bool user_exists(char *user_name);
 
@@ -116,9 +119,6 @@ void write_to_history(char *cmd);
 void run_nth_history(char *cmd);
 
 void strrevr(char *str, const int length);
-
-
-
 
 /*
  * main - The shell's main routine 
@@ -199,7 +199,7 @@ int main(int argc, char **argv) {
 
     free(username);
     free(home);
-    exit(0); /* control never reaches here */
+    exit(EXIT_SUCCESS); /* control never reaches here */
 
 }
 
@@ -220,7 +220,9 @@ char *login() {
         scanf("%s", username);
 
         if (strcmp(username, "quit") == 0) {
-            quit();
+            free(home);
+            free(username);
+            exit(EXIT_SUCCESS);
         }
         
         printf("password: ");
@@ -284,20 +286,23 @@ void authenticate(const char *username, const char *password, bool *authenticate
 }
 
 /* quit - Quit the shell */
-void quit() {
+void quit(char *cmd) {
+    /* Write command */
+    write_to_history(cmd);
+
     /* Free memory not used after this */
     free(home);
     free(username);
-    exit(0);
+    exit(EXIT_SUCCESS);
 }
 
 /* logout - Logout of the shell */
-void logout() {
+void logout(char *cmd) {
     /* Check if any jobs are remaining */
     if (are_open_jobs(jobs)) {
         user_error("There are suspended jobs.");
     } else {
-        quit();
+        quit(cmd);
     }
 }
 
@@ -520,6 +525,10 @@ void run_nth_history(char *cmd) {
         sprintf(sbuf, "Called command %d from history, however only %d commands present in history.", n, h_length);
         reset_state_error(sbuf);
         return;
+    } else if (n < 1) {
+        sprintf(sbuf, "Called command %d from history, however the number must be greater than 0.", n);
+        reset_state_error(sbuf);
+        return;
     }
     n -= 1;
 
@@ -588,15 +597,9 @@ void eval(char *cmdline) {
         return;   /* Ignore empty lines */
     }
 
-    /* Add command to history and .tsh_history */
-    if (buf[strlen(buf) - 1] == '\n') {
-        buf[strlen(buf) - 1] = '\0';
-    }
-    write_to_history(buf);
-
     /* Fork child process as job if the command is not a built-in command */
     if (!builtin_cmd(argv)) {
-        printf("Forking child process as job\n");
+        printf("Forking child process as job for command - %s", buf);
         // if ((pid = fork()) == 0) {   /* Child runs user job */
         //     if (execve(argv[0], argv, environ) < 0) {
         //         printf("%s: Command not found.\n", argv[0]);
@@ -617,6 +620,12 @@ void eval(char *cmdline) {
         /* If the command is a built-in command, execute it immediately in the foreground */
         exec_builtin(argv);
     }
+
+    /* Add command to history and .tsh_history */
+    if (buf[strlen(buf) - 1] == '\n') {
+        buf[strlen(buf) - 1] = '\0';
+    }
+    write_to_history(buf);
 
 
     return;
@@ -713,9 +722,13 @@ int builtin_cmd(char **argv) {
  */
 void exec_builtin(char **argv) {
     if (strcmp(argv[0], "quit") == 0) {
-        quit();
+        char cmd[MAXLINE];
+        strcpy(cmd, "quit");
+        quit(cmd);
     } else if (strcmp(argv[0], "logout") == 0) {
-        logout();
+        char cmd[MAXLINE];
+        strcpy(cmd, "logout");
+        logout(cmd);
     } else if (strcmp(argv[0], "history") == 0) {
         show_history();
     } else if (argv[0][0] == '!') {
@@ -757,7 +770,34 @@ void waitfg(pid_t pid) {
  *     currently running children to terminate.  
  */
 void sigchld_handler(int sig) {
-    return;
+    if (sig == SIGCHLD) {
+        int olderrno = errno;
+        sigset_t mask_all, prev_all;
+        pid_t pid;
+        int status;
+        sigfillset(&mask_all);
+        while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) { /* Reap all children */
+            /* Block all signals */
+            sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+
+            /* Did the child process exit normally */
+            if (WIFEXITED(status)) {
+                deletejob(jobs, pid);
+            } else if (WIFSIGNALED(status)) { /* Was the child process signalled to exit */
+                deletejob(jobs, pid);
+            } else if (WIFSTOPPED(status)) { /*Was the child process stopped and if so, maintain the job but update the state */
+                getjobpid(jobs, pid)->state = ST;
+            }
+
+            /* Unblock all signals */
+            sigprocmask(SIG_SETMASK, &prev_all, NULL);
+        }
+
+        if (errno != ECHILD) {
+            unix_error("waitpid error");
+        }
+        errno = olderrno;
+    }
 }
 
 /* 
@@ -766,7 +806,14 @@ void sigchld_handler(int sig) {
  *    to the foreground job.  
  */
 void sigint_handler(int sig) {
-    return;
+    if (sig == SIGINT) {
+        int olderrno = errno;
+        pid_t pid = fgpid(jobs);
+        if (pid != 0) {
+            kill(-pid, SIGINT);
+        }
+        errno = olderrno;
+    }
 }
 
 /*
@@ -775,7 +822,14 @@ void sigint_handler(int sig) {
  *     foreground job by sending it a SIGTSTP.  
  */
 void sigtstp_handler(int sig) {
-    return;
+    if (sig == SIGTSTP) {
+        int olderrno = errno;
+        pid_t pid = fgpid(jobs);
+        if (pid != 0) {
+            kill(-pid, SIGTSTP);
+        }
+        errno = olderrno;
+    }
 }
 
 /*********************
@@ -956,7 +1010,7 @@ void usage(void) {
     printf("   -h   print this message\n");
     printf("   -v   print additional diagnostic information\n");
     printf("   -p   do not emit a command prompt\n");
-    exit(1);
+    exit(EXIT_SUCCESS);
 }
 
 /*
@@ -997,8 +1051,9 @@ handler_t *Signal(int signum, handler_t *handler) {
     sigemptyset(&action.sa_mask); /* block sigs of type being handled */
     action.sa_flags = SA_RESTART; /* restart syscalls if possible */
 
-    if (sigaction(signum, &action, &old_action) < 0)
-	unix_error("Signal error");
+    if (sigaction(signum, &action, &old_action) < 0) {
+        unix_error("Signal error");
+    }
     return (old_action.sa_handler);
 }
 
@@ -1008,8 +1063,6 @@ handler_t *Signal(int signum, handler_t *handler) {
  */
 void sigquit_handler(int sig) {
     printf("Terminating after receipt of SIGQUIT signal\n");
-    exit(1);
+    exit(EXIT_FAILURE);
 }
-
-
 

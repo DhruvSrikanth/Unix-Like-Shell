@@ -19,14 +19,17 @@ shell: run remove_exe
 compile: ./tsh.c
 	$(GCC) -std=$(STD) -o tsh ./tsh.c
 
-remove_exe: ./tsh
-	rm ./tsh
+remove_exe: 
+	@rm ./tsh
 
 run: compile
 	./tsh
 
 reset: remove_exe
-	rm -rf $(ROOT)/*
-	mkdir $(ROOT)
-	touch $(ROOT)/.tsh_history
-	clear
+	@rm -rf $(ROOT)/*
+	@mkdir $(ROOT)
+	@touch $(ROOT)/.tsh_history
+
+help: compile
+	./tsh -h
+	@rm ./tsh
