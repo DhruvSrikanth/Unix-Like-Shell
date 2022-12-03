@@ -71,7 +71,7 @@ struct stat_t {
 };
 
 char history[MAXHISTORY][MAXLINE];  /* The history list */
-pid_t session_id;                   /* The session id of the shell */
+volatile sig_atomic_t session_id;   /* The session id of the shell */
 volatile sig_atomic_t pid_buf;     
 /* End global variables */
 
@@ -126,7 +126,8 @@ void reset_history();
 
 /* Stat functions */
 void shell_stat(struct stat_t *stat);
-void make_stat(struct stat_t *stat, pid_t pid, char *cmd);
+void get_stat(struct stat_t *stat, pid_t pid, char *cmd, int process_state);
+void determine_stat_state(struct stat_t *stat, int process_state);
 
 /* Proc functions */
 void create_proc_entry(struct stat_t *stat);
@@ -436,9 +437,6 @@ void quit(int sig) {
         reset_history();
     }
 
-    /* Remove session proc entry */
-    remove_proc_entry(session_id);
-
     /* Remove all proc entries */
     remove_proc_entries();
 
@@ -454,6 +452,9 @@ void logout(int sig) {
     if (are_open_jobs(jobs)) {
         user_error("There are suspended jobs.");
     } else {
+        /* Remove session proc entry */
+        remove_proc_entry(session_id);
+        
         quit(sig);
     }
 }
@@ -504,7 +505,13 @@ void eval(char *cmdline) {
 
             /* Write to proc/PID/status */
             struct stat_t stat;
-            get_stat(&stat, getpid(), argv[0]);
+            int process_state;
+            if (bg) {
+                process_state = BG;
+            } else {
+                process_state = FG;
+            }
+            get_stat(&stat, getpid(), argv[0], process_state);
             create_proc_entry(&stat);
 
             /* Execute the command */
@@ -1059,24 +1066,64 @@ void shell_stat(struct stat_t *stat) {
     stat->ppid = getppid();
     stat->pgid = stat->pid;
     stat->sid = stat->pid;
-    strcpy(stat->state, "Rs");
+    strcpy(stat->state, "Ss");
     strcpy(stat->uname, username);
 
     session_id = stat->sid;
 }
 
 /* get_stat - Create stat struct for process */
-void get_stat(struct stat_t *stat, pid_t pid, char *cmd) {
+void get_stat(struct stat_t *stat, pid_t pid, char *cmd, int process_state) {
     /* Get the process details */
     strcpy(stat->name, cmd);
     stat->pid = pid;
     stat->ppid = getppid();
     stat->pgid = getpgid(pid);
     stat->sid = session_id;
-    strcpy(stat->state, "Ss");
+    /* Determine the state */
+    determine_stat_state(stat, process_state);
     strcpy(stat->uname, username);
 }
 
+/* determine_stat_state - Determine the state of the stat struct based on background/foreground */
+void determine_stat_state(struct stat_t *stat, int process_state) {
+    char first_char;
+    
+    if (stat->pid == stat->sid) {
+        first_char = 'S';
+    } else {
+        switch (process_state) {
+            case FG:
+                first_char = 'R';
+                break;
+            case BG:
+                first_char = 'R';
+                break;
+            case ST:
+                first_char = 'T';
+                break;
+            case UNDEF:
+                first_char = '!'; /* Should never happen */
+                unix_error("Undefined process state.");
+                break;
+            default:
+                first_char = '?'; /* Should never happen */
+                unix_error("Unknown process state.");
+                break;
+        }
+    }
+
+    char second_char;
+    if (stat->pid == stat->sid) {
+        second_char = 's';
+    } else if (process_state == FG) {
+        second_char = '+';
+    } else {
+        second_char = '\0';
+    }
+
+    sprintf(stat->state, "%c%c", first_char, second_char);
+}
 
 /*****************
  * End of stat functions
@@ -1119,7 +1166,9 @@ void write_proc_entry(struct stat_t *stat) {
         return;
     }
 
-    sprintf(sbuf, "Name: %s\nPid: %d\nPPid: %d\nPGid: %d\nSid: %d\nSTAT: %s\nUsername: %s\n", stat->name, stat->pid, stat->ppid, stat->pgid, stat->sid, stat->state, stat->uname);
+    sprintf(sbuf, "Name: %s\nPid: %d\nPPid: %d\nPGid: %d\nSid: %d\nSTAT: %s\nUsername: %s\n", 
+    stat->name, stat->pid, stat->ppid, stat->pgid, stat->sid, stat->state, stat->uname);
+
     const size_t written = fprintf(fp, "%s", sbuf);
     if (written != strlen(sbuf)) {
         reset_state_error("Could not write to proc/PID/status file.");
@@ -1144,7 +1193,9 @@ void read_proc_entry(struct stat_t *stat, pid_t pid) {
     }
 
     /* Read the file */
-    fscanf(fp, "Name: %s\nPid: %d\nPPid: %d\nPGid: %d\nSid: %d\nSTAT: %s\nUsername: %s\n", stat->name, &stat->pid, &stat->ppid, &stat->pgid, &stat->sid, stat->state, stat->uname);
+    fscanf(fp, "Name: %s\nPid: %d\nPPid: %d\nPGid: %d\nSid: %d\nSTAT: %s\nUsername: %s\n", 
+    stat->name, &stat->pid, &stat->ppid, &stat->pgid, &stat->sid, stat->state, stat->uname);
+
     fclose(fp);
 }
 
