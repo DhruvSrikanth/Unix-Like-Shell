@@ -66,13 +66,14 @@ struct stat_t {
     pid_t ppid;             /* parent process id */
     pid_t pgid;             /* process group id */
     pid_t sid;              /* session id */
-    char state[MAXLINE];     /* state of the process */
+    char state[MAXLINE];    /* state of the process */
     char uname[MAXLINE];    /* user name */
 };
 
 char history[MAXHISTORY][MAXLINE];  /* The history list */
-volatile sig_atomic_t session_id;   /* The session id of the shell */
-volatile sig_atomic_t pid_buf;     
+volatile int session_id;            /* The session id of the shell */
+volatile sig_atomic_t pid_buf;      /* pid dummy variable that is signal safe */
+volatile sig_atomic_t fg_pid;       /* pid of the foreground process */
 /* End global variables */
 
 
@@ -98,9 +99,6 @@ int parseline(const char *cmdline, char **argv);
 int builtin_cmd(char **argv);
 void exec_builtin(char **argv);
 
-/* Job manipulation functions */
-void do_bgfg(char **argv);
-void waitfg(pid_t pid);
 
 /* Job helper functions */
 void clearjob(struct job_t *job);
@@ -124,9 +122,14 @@ void write_to_history(char *cmd);
 void run_nth_history(char *cmd);
 void reset_history();
 
+/* State manipulation functions */
+void do_bgfg(char **argv);
+void waitfg(pid_t pid, sigset_t *prev_one);
+int bg_to_state(int bg);
+
 /* Stat functions */
 void shell_stat(struct stat_t *stat);
-void get_stat(struct stat_t *stat, pid_t pid, char *cmd, int process_state);
+void get_stat(struct stat_t *stat, pid_t pid, char *cmd, int process_state); 
 void determine_stat_state(struct stat_t *stat, int process_state);
 
 /* Proc functions */
@@ -145,11 +148,17 @@ void sigquit_handler(int sig);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
 
+/* Signal safe functions */
+ssize_t sio_puts(char s[]);
+static size_t sio_strlen(char s[]);
+void sio_error(char s[]);
+
 /* Error functions */
 void unix_error(char *msg);
 void app_error(char *msg);
 void reset_state_error(char *msg);
 void user_error(char *msg);
+void sigsafe_error(char *msg);
 
 /* Additional helper functions */
 bool isnum(char *str);
@@ -454,7 +463,7 @@ void logout(int sig) {
     } else {
         /* Remove session proc entry */
         remove_proc_entry(session_id);
-        
+
         quit(sig);
     }
 }
@@ -492,27 +501,38 @@ void eval(char *cmdline) {
         return;   /* Ignore empty lines */
     }
 
+    /* Signal handling */
+    sigset_t mask_all, prev_one, mask_one; /* Sets of signal sets */
+    sigfillset(&mask_all); /* Fill the mask with all signals */
+    sigemptyset(&mask_one); /* Empty the mask */
+    sigaddset(&mask_one, SIGCHLD); /* Add SIGCHLD to the mask */    
+
     /* Add command to history and .tsh_history */
     write_to_history(buf);
 
     /* Fork child process as job if the command is not a built-in command */
     if (!builtin_cmd(argv)) {
+        /* Block SIGCHLD */
+        sigprocmask(SIG_BLOCK, &mask_one, &prev_one);
+
+        /* Fork the child */
         if ((pid = fork()) == 0) {   /* Child runs user job */
-            /* Set the process group ID */
-            if (setpgid(0, 0) == -1) {
-                reset_state_error("Could not set process group ID.");
-            }
+            /* Unblock SIGCHLD */
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
 
             /* Write to proc/PID/status */
             struct stat_t stat;
-            int process_state;
-            if (bg) {
-                process_state = BG;
-            } else {
-                process_state = FG;
-            }
-            get_stat(&stat, getpid(), argv[0], process_state);
+            get_stat(&stat, getpid(), argv[0], bg_to_state(bg));
             create_proc_entry(&stat);
+            
+            /* Put the shell in another group  */
+            if (setpgid(0, 0) == -1) {
+                reset_state_error("Could not set process group ID.");
+            }
+            
+            if (!bg) {
+                fg_pid = 0;
+            }
 
             /* Execute the command */
             if (execve(argv[0], argv, environ) < 0) {
@@ -521,12 +541,16 @@ void eval(char *cmdline) {
             }
         }
 
+        /* Block all signals */
+        sigprocmask(SIG_BLOCK, &mask_all, NULL);
+        /* Add job */
+        addjob(jobs, pid, bg_to_state(bg), cmdline);
+        /* Unblock SIGCHLD */
+        sigprocmask(SIG_SETMASK, &prev_one, NULL);
+
         /* Parent waits for foreground job to terminate */
         if (!bg) {
-            int status;
-            if (waitpid(pid, &status, 0) < 0) {
-                unix_error("waitfg: waitpid error");
-            }
+            waitfg(pid, &prev_one);
         } else {
             printf("%d %s", pid, cmdline);
         }
@@ -636,9 +660,9 @@ void exec_builtin(char **argv) {
     } else if (argv[0][0] == '!') {
         run_nth_history(argv[0]);
     } else if (strcmp(argv[0], "bg") == 0) {
-        printf("bg\n");
+        do_bgfg(argv);
     } else if (strcmp(argv[0], "fg") == 0) {
-        printf("fg\n");
+        do_bgfg(argv);
     } else if (strcmp(argv[0], "jobs") == 0) {
         listjobs(jobs);
     } else if (strcmp(argv[0], "adduser") == 0) {
@@ -651,26 +675,143 @@ void exec_builtin(char **argv) {
  * ****************/
 
 /*****************
- * Job manipulation functions
+ * State manipulation functions
  * ****************/
 
 /* 
  * do_bgfg - Execute the builtin bg and fg commands
  */
 void do_bgfg(char **argv) {
-    return;
+    int pid_or_jid = atoi(argv[1]);
+    struct job_t *job_to_modify; 
+    /* Determine whether it is a jid or pid */
+    /* Since the jid is limited to the size of the jobs list */
+    /* we check if there is a valid pid to jid conversion */
+    int jid = pid2jid(pid_or_jid);
+    if (jid == 0) {
+        /* It is a pid */
+        job_to_modify = getjobpid(jobs, pid_or_jid);
+    } else {
+        /* It is a jid */
+        job_to_modify = getjobjid(jobs, jid);
+    }
+    pid_or_jid = (jid == 0) ? pid_or_jid : jid;
+
+    /* Check if the job exists */
+    if (job_to_modify == NULL) {
+        sprintf(sbuf, "Job (%%%d) does not exist.", pid_or_jid);
+        user_error(sbuf);
+        return;
+    }
+
+    /* 
+    * Jobs states: FG (foreground), BG (background), ST (stopped)
+    * Job state transitions and enabling actions:
+    *     FG -> ST  : ctrl-z
+    *     ST -> FG  : fg command
+    *     ST -> BG  : bg command
+    *     BG -> FG  : fg command
+    * At most 1 job can be in the FG state.
+    */
+
+    /* Check if the job is in the foreground */
+    if (job_to_modify->state == FG) {
+        /* If the job is in the background, the user must first stop the job */
+        if (strcmp(argv[0], "bg") == 0) {
+            sprintf(sbuf, "Job (%%%d) must be stopped before moving it to the background.", pid_or_jid);
+            user_error(sbuf);
+            return;
+        } else {
+            /* If the job is in the foreground, we can't change it */
+            sprintf(sbuf, "Job (%%%d) is already in the foreground.", pid_or_jid);
+            user_error(sbuf);
+            return;
+        }
+        return;
+    }
+
+    /* Check if the job is in the background */
+    if (job_to_modify->state == BG) {
+        if (strcmp(argv[0], "bg") == 0) {
+            /* If the job is in the background and the user wants to put it in the background, we can't change it */
+            sprintf(sbuf, "Job (%%%d) is already in the background.", pid_or_jid);
+            user_error(sbuf);
+            return;
+        } else {
+            /* User want to move a job from the background to the foreground */
+            job_to_modify->state = FG;
+            
+            // Edit the proc file
+            edit_proc_entry(job_to_modify->pid, "R+");
+
+            /* Wait for the job to finish */
+            sigset_t prev_one;
+            sigemptyset(&prev_one); /* Create empty set */
+            sigaddset(&prev_one, SIGCHLD); /* Add SIGCHLD to wait for */
+
+            /* Wait for the job to finish */
+            waitfg(job_to_modify->pid, &prev_one);
+            return;
+        }
+    }
+
+    /* Check if the job is stopped */
+    if (job_to_modify->state == ST) {
+        if (strcmp(argv[0], "bg") == 0) {
+            /* User want to move a job from stopped to the foreground */
+            job_to_modify->state = BG;
+            
+            // Edit the proc file
+            edit_proc_entry(job_to_modify->pid, "R");
+
+            /* Send the job a SIGCONT signal to wake it up */
+            kill(-job_to_modify->pid, SIGCONT);
+            
+            return;
+        } else {
+            /* User want to move a job from stopped to the foreground */
+            job_to_modify->state = FG;
+            
+            // Edit the proc file
+            edit_proc_entry(job_to_modify->pid, "R+");
+
+            /* Send the job a SIGCONT signal to wake it up */
+            kill(-job_to_modify->pid, SIGCONT);
+
+            /* Wait for the job to finish */
+            sigset_t prev_one;
+            sigemptyset(&prev_one); /* Create empty set */
+            sigaddset(&prev_one, SIGCHLD); /* Add SIGCHLD to wait for */
+
+            /* Wait for the job to finish */
+            waitfg(job_to_modify->pid, &prev_one);
+            return;
+        }
+    }
 }
 
 /* 
  * waitfg - Block until process pid is no longer the foreground process
  */
-void waitfg(pid_t pid) {
-    return;
+void waitfg(pid_t pid, sigset_t *block_set) {
+    while (pid != fg_pid) {
+        sigsuspend(block_set);
+    }
 }
 
+/* bg_to_state - Convert bg indicator flag to BG/FG state code */
+int bg_to_state(int bg) {
+    int process_state;
+    if (bg) {
+        process_state = BG;
+    } else {
+        process_state = FG;
+    }
+    return process_state;
+}
 
 /*****************
- * End of job manipulation functions
+ * End of State manipulation functions
  * ****************/
 
 /***********************************************
@@ -772,11 +913,16 @@ pid_t fgpid(struct job_t *jobs) {
 struct job_t *getjobpid(struct job_t *jobs, pid_t pid) {
     int i;
 
-    if (pid < 1)
-	return NULL;
-    for (i = 0; i < MAXJOBS; i++)
-	if (jobs[i].pid == pid)
-	    return &jobs[i];
+    if (pid < 1) {
+        return NULL;
+    }
+
+    for (i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].pid == pid) {
+            return &jobs[i];
+        }
+    }
+
     return NULL;
 }
 
@@ -784,11 +930,16 @@ struct job_t *getjobpid(struct job_t *jobs, pid_t pid) {
 struct job_t *getjobjid(struct job_t *jobs, int jid) {
     int i;
 
-    if (jid < 1)
-	return NULL;
-    for (i = 0; i < MAXJOBS; i++)
-	if (jobs[i].jid == jid)
-	    return &jobs[i];
+    if (jid < 1) {
+        return NULL;
+    }
+ 
+    for (i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].jid == jid) {
+            return &jobs[i];
+        }
+    }
+
     return NULL;
 }
 
@@ -796,12 +947,16 @@ struct job_t *getjobjid(struct job_t *jobs, int jid) {
 int pid2jid(pid_t pid) {
     int i;
 
-    if (pid < 1)
-	return 0;
-    for (i = 0; i < MAXJOBS; i++)
-	if (jobs[i].pid == pid) {
-        return jobs[i].jid;
+    if (pid < 1) {
+        return 0;
     }
+
+    for (i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].pid == pid) {
+            return jobs[i].jid;
+        }
+    }
+
     return 0;
 }
 
@@ -1145,7 +1300,7 @@ void create_proc_entry(struct stat_t *stat) {
         reset_state_error(sbuf);
         return;
     }
-
+    
     /* Write to the file */
     write_proc_entry(stat);
 }
@@ -1285,34 +1440,43 @@ void remove_proc_entries() {
  *     currently running children to terminate.  
  */
 void sigchld_handler(int sig) {
-    // if (sig == SIGCHLD) {
-    //     int olderrno = errno;
-    //     sigset_t mask_all, prev_all;
-    //     pid_t pid;
-    //     int status;
-    //     sigfillset(&mask_all);
-    //     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) { /* Reap all children */
-    //         /* Block all signals */
-    //         sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+    if (sig == SIGCHLD) {
+        int olderrno = errno;
+        sigset_t mask_all, prev_all;
+        sigfillset(&mask_all);
 
-    //         /* Did the child process exit normally */
-    //         if (WIFEXITED(status)) {
-    //             deletejob(jobs, pid);
-    //         } else if (WIFSIGNALED(status)) { /* Was the child process signalled to exit */
-    //             deletejob(jobs, pid);
-    //         } else if (WIFSTOPPED(status)) { /*Was the child process stopped and if so, maintain the job but update the state */
-    //             getjobpid(jobs, pid)->state = ST;
-    //         }
+        int status;
+        /* Reap all available zombie children */
+        while ((pid_buf = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+            /* Block all signals */
+            sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
 
-    //         /* Unblock all signals */
-    //         sigprocmask(SIG_SETMASK, &prev_all, NULL);
-    //     }
+            /* Check if the child terminated normally or there was some error */
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                /* Remove the proc entry and delete job */
+                int job_state = getjobpid(jobs, pid_buf)->state;
+                deletejob(jobs, pid_buf);
+                remove_proc_entry(pid_buf);
+                /* Set the foreground pid to let waitfg know to exit */
+                if (job_state == FG) {
+                    fg_pid = pid_buf;
+                }
+            } else if (WIFSTOPPED(status)) { /* Check if the child stopped */
+                /* Edit the proc entry and the job state */
+                getjobpid(jobs, pid_buf)->state = ST;
+                edit_proc_entry(pid_buf, "T");
+            }
 
-    //     if (errno != ECHILD) {
-    //         unix_error("waitpid error");
-    //     }
-    //     errno = olderrno;
-    // }
+            /* Unblock all signals */
+            sigprocmask(SIG_SETMASK, &prev_all, NULL);
+        }
+
+
+        if (errno != ECHILD) {
+            sigsafe_error("waitpid error");
+        }
+        errno = olderrno;
+    }
     return;
 }
 
@@ -1324,10 +1488,25 @@ void sigchld_handler(int sig) {
 void sigint_handler(int sig) {
     if (sig == SIGINT) {
         int olderrno = errno;
-        pid_t pid = fgpid(jobs);
-        if (pid != 0) {
-            kill(-pid, SIGINT);
+
+        sigset_t mask_all, prev_all;
+        sigfillset(&mask_all);
+        /* Block all signals */
+        sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+        pid_buf = fgpid(jobs);
+        /* Unblock all signals */
+        sigprocmask(SIG_SETMASK, &prev_all, NULL);
+        if (pid_buf != 0) {
+            /* Send the signal to the foreground job */
+            if (kill(-pid_buf, SIGINT) < 0) {
+                sigsafe_error("kill error");
+            }
         }
+
+        if (errno != ECHILD) {
+            sigsafe_error("waitpid error");
+        }
+
         errno = olderrno;
     }
 }
@@ -1340,11 +1519,34 @@ void sigint_handler(int sig) {
 void sigtstp_handler(int sig) {
     if (sig == SIGTSTP) {
         int olderrno = errno;
-        pid_t pid = fgpid(jobs);
-        if (pid != 0) {
-            kill(-pid, SIGTSTP);
+
+        sigset_t mask_all, prev_all;
+        sigfillset(&mask_all);
+        /* Block all signals */
+        sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+        
+        pid_buf = fgpid(jobs);
+        
+        /* Edit job state and proc entry stat field */
+        getjobpid(jobs, pid_buf)->state = ST;
+        edit_proc_entry(pid_buf, "T");
+
+        /* Unblock all signals */
+        sigprocmask(SIG_SETMASK, &prev_all, NULL);
+
+        if (pid_buf != 0) {
+            /* Send the signal to the foreground job */
+            if (kill(-pid_buf, SIGTSTP) < 0) {
+                sigsafe_error("kill error");
+            }
         }
+
+        if (errno != ECHILD) {
+            sigsafe_error("waitpid error");
+        }
+
         errno = olderrno;
+
     }
 }
 
@@ -1370,13 +1572,41 @@ handler_t *Signal(int signum, handler_t *handler) {
  */
 void sigquit_handler(int sig) {
     printf("Terminating after receipt of SIGQUIT signal\n");
-    exit(EXIT_FAILURE);
+    _exit(EXIT_FAILURE);
 }
 
 
 /*********************
  * End signal handlers
  *********************/
+
+/*****************
+ * Signal safe functions
+ * ****************/
+/* Citation: csapp.c - Functions for the CS:APP3e book */
+
+/* sio_puts - Print string in signal safe manner */
+ssize_t sio_puts(char s[]) {
+    return write(STDOUT_FILENO, s, sio_strlen(s));
+}
+
+/* sio_strlen - Return length of string (from K&R) */
+static size_t sio_strlen(char s[]) {
+    int i = 0;
+    while (s[i] != '\0')
+        ++i;
+    return i;
+}
+
+/* sigsafe_error - Print error message in signal safe manner */
+void sio_error(char s[]) {
+    sio_puts(s);
+    _exit(EXIT_FAILURE);
+}
+
+/*****************
+ * End signal safe functions
+ * ****************/
 
 /*****************
  * Error functions
@@ -1410,7 +1640,12 @@ void user_error(char *msg) {
     fprintf(stdout, "%s\n", msg);
 }
 
-
+/* sigsafe_error - Signal safe error */
+void sigsafe_error(char *msg) {
+    sio_puts(msg);
+    sio_puts(": ");
+    sio_error(strerror(errno));
+}
 
 /*****************
  * End of error functions
