@@ -804,6 +804,7 @@ void waitfg(pid_t pid, sigset_t *block_set) {
     while (pid != fg_pid) {
         sigsuspend(block_set);
     }
+    fg_pid = 0;
 }
 
 /* bg_to_state - Convert bg indicator flag to BG/FG state code */
@@ -1462,14 +1463,14 @@ void sigchld_handler(int sig) {
 
             /* Check if the child terminated normally or there was some error */
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                /* Remove the proc entry and delete job */
                 int job_state = getjobpid(jobs, pid_buf)->state;
-                deletejob(jobs, pid_buf);
-                remove_proc_entry(pid_buf);
                 /* Set the foreground pid to let waitfg know to exit */
                 if (job_state == FG) {
                     fg_pid = pid_buf;
                 }
+                /* Remove the proc entry and delete job */
+                remove_proc_entry(pid_buf);
+                deletejob(jobs, pid_buf);
             } else if (WIFSTOPPED(status)) { /* Check if the child stopped */
                 /* Edit the proc entry and the job state */
                 getjobpid(jobs, pid_buf)->state = ST;
