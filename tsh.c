@@ -741,7 +741,10 @@ void do_bgfg(char **argv) {
             /* User want to move a job from the background to the foreground */
             job_to_modify->state = FG;
             
-            // Edit the proc file
+            /* Set the foreground pid to 0 to make waitfg wait */
+            fg_pid = 0;
+
+            /* Edit the proc file */
             edit_proc_entry(job_to_modify->pid, "R+");
 
             /* Wait for the job to finish */
@@ -772,8 +775,12 @@ void do_bgfg(char **argv) {
             /* User want to move a job from stopped to the foreground */
             job_to_modify->state = FG;
             
-            // Edit the proc file
+            /* Set the fg_pid to 0 to make waitfg wait */
+            fg_pid = 0;
+
+            /* Edit the proc file */
             edit_proc_entry(job_to_modify->pid, "R+");
+
 
             /* Send the job a SIGCONT signal to wake it up */
             kill(-job_to_modify->pid, SIGCONT);
@@ -1445,7 +1452,9 @@ void sigchld_handler(int sig) {
         sigset_t mask_all, prev_all;
         sigfillset(&mask_all);
 
+        /* Determine how the child process stopped */
         int status;
+
         /* Reap all available zombie children */
         while ((pid_buf = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
             /* Block all signals */
@@ -1465,6 +1474,9 @@ void sigchld_handler(int sig) {
                 /* Edit the proc entry and the job state */
                 getjobpid(jobs, pid_buf)->state = ST;
                 edit_proc_entry(pid_buf, "T");
+                /* Reset the foreground process to let waitfg know to exit */
+                fg_pid = pid_buf;
+                /* This section is handled by the SIGSTP handler and is repeated for clarity */
             }
 
             /* Unblock all signals */
@@ -1472,9 +1484,10 @@ void sigchld_handler(int sig) {
         }
 
 
-        if (errno != ECHILD) {
-            sigsafe_error("waitpid error");
-        }
+        // if (errno != ECHILD) {
+        //     sigsafe_error("SIGCHLD error");
+        // }
+
         errno = olderrno;
     }
     return;
@@ -1493,19 +1506,29 @@ void sigint_handler(int sig) {
         sigfillset(&mask_all);
         /* Block all signals */
         sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+        
         pid_buf = fgpid(jobs);
-        /* Unblock all signals */
-        sigprocmask(SIG_SETMASK, &prev_all, NULL);
+
         if (pid_buf != 0) {
+            /* Delete the job and proc entry */
+            deletejob(jobs, pid_buf);
+            remove_proc_entry(pid_buf);
+
+            /* Set the fg_pid to pid_buf to tell waitfg to exit */
+            fg_pid = pid_buf;
+
             /* Send the signal to the foreground job */
             if (kill(-pid_buf, SIGINT) < 0) {
                 sigsafe_error("kill error");
             }
         }
 
-        if (errno != ECHILD) {
-            sigsafe_error("waitpid error");
-        }
+        /* Unblock all signals */
+        sigprocmask(SIG_SETMASK, &prev_all, NULL);
+
+        // if (errno != ECHILD) {
+        //     sigsafe_error("SIGINT error");
+        // }
 
         errno = olderrno;
     }
@@ -1531,8 +1554,6 @@ void sigtstp_handler(int sig) {
         getjobpid(jobs, pid_buf)->state = ST;
         edit_proc_entry(pid_buf, "T");
 
-        /* Unblock all signals */
-        sigprocmask(SIG_SETMASK, &prev_all, NULL);
 
         if (pid_buf != 0) {
             /* Send the signal to the foreground job */
@@ -1541,9 +1562,12 @@ void sigtstp_handler(int sig) {
             }
         }
 
-        if (errno != ECHILD) {
-            sigsafe_error("waitpid error");
-        }
+        /* Unblock all signals */
+        sigprocmask(SIG_SETMASK, &prev_all, NULL);
+
+        // if (errno != ECHILD) {
+        //     sigsafe_error("SIGTSTP error");
+        // }
 
         errno = olderrno;
 
