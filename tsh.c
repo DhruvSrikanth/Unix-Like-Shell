@@ -1460,14 +1460,22 @@ void sigchld_handler(int sig) {
         while ((pid_buf = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
             /* Block all signals */
             sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
-
             /* Check if the child terminated normally or there was some error */
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                int job_state = getjobpid(jobs, pid_buf)->state;
+                /* Get the job */
+                struct job_t *job = getjobpid(jobs, pid_buf);
+                if (job == NULL) {
+                    /* Unblock */
+                    sigprocmask(SIG_SETMASK, &prev_all, NULL);
+                    errno = olderrno;
+                    return;
+                }
+
                 /* Set the foreground pid to let waitfg know to exit */
-                if (job_state == FG) {
+                if (job->state == FG) {
                     fg_pid = pid_buf;
                 }
+
                 /* Remove the proc entry and delete job */
                 remove_proc_entry(pid_buf);
                 deletejob(jobs, pid_buf);
