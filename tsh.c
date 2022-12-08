@@ -627,7 +627,7 @@ int parseline(const char *cmdline, char **argv) {
 int builtin_cmd(char **argv) {
     /* Built-in commands */
     const int n_builtins = 7;
-    const char *builtins[n_builtins] = {"quit", "logout", "history", "bg", "fg", "jobs", "adduser"};
+    const char *builtins[] = {"quit", "logout", "history", "bg", "fg", "jobs", "adduser"};
     for (int i = 0; i < n_builtins; i++) {
         if (strcmp(argv[0], builtins[i]) == 0) {
             return 1;
