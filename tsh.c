@@ -753,7 +753,7 @@ void do_bgfg(char **argv) {
             sigaddset(&prev_one, SIGCHLD); /* Add SIGCHLD to wait for */
 
             /* Wait for the job to finish */
-            waitfg(job_to_modify->pid, &prev_one);
+            // waitfg(job_to_modify->pid, &prev_one);
             return;
         }
     }
@@ -791,7 +791,7 @@ void do_bgfg(char **argv) {
             sigaddset(&prev_one, SIGCHLD); /* Add SIGCHLD to wait for */
 
             /* Wait for the job to finish */
-            waitfg(job_to_modify->pid, &prev_one);
+            // waitfg(job_to_modify->pid, &prev_one);
             return;
         }
     }
@@ -1480,8 +1480,16 @@ void sigchld_handler(int sig) {
                 remove_proc_entry(pid_buf);
                 deletejob(jobs, pid_buf);
             } else if (WIFSTOPPED(status)) { /* Check if the child stopped */
+                /* Get the job */
+                struct job_t *job = getjobpid(jobs, pid_buf);
+                if (job == NULL) {
+                    /* Unblock */
+                    sigprocmask(SIG_SETMASK, &prev_all, NULL);
+                    errno = olderrno;
+                    return;
+                }
                 /* Edit the proc entry and the job state */
-                getjobpid(jobs, pid_buf)->state = ST;
+                job->state = ST;
                 edit_proc_entry(pid_buf, "T");
                 /* Reset the foreground process to let waitfg know to exit */
                 fg_pid = pid_buf;
